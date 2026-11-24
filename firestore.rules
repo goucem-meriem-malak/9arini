@@ -1,0 +1,225 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function verified() { return signedIn() && request.auth.token.email_verified == true; }
+    function str(v, lo, hi) { return v is string && v.size() >= lo && v.size() <= hi; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function keysOnly(list) { return request.resource.data.keys().hasOnly(list); }
+    function userData(id) { return get(/databases/$(database)/documents/users/$(id)).data; }
+    function classData(id) { return get(/databases/$(database)/documents/classes/$(id)).data; }
+    function memberPath(c, u) { return /databases/$(database)/documents/classes/$(c)/members/$(u); }
+    function isTutorOf(c) { return signedIn() && classData(c).tutorId == me(); }
+    function isApproved(c) { return signedIn() && exists(memberPath(c, me())) && get(memberPath(c, me())).data.status == 'approved'; }
+    function canRead(c) { return isTutorOf(c) || isApproved(c); }
+
+    function validClass(d) {
+      return str(d.title, 3, 80) && str(d.description, 0, 1500) && str(d.subject, 1, 20) && str(d.level, 1, 10)
+        && d.price is int && d.price >= 0 && d.price <= 1000000
+        && d.priceUnit in ['month', 'session']
+        && str(d.wilaya, 1, 3) && str(d.commune, 0, 40)
+        && d.mode in ['in_person', 'online', 'both']
+        && str(d.schedule, 0, 120)
+        && d.capacity is int && d.capacity >= 1 && d.capacity <= 200
+        && d.status in ['open', 'closed'];
+    }
+
+    function validJoin(c, d) {
+      let cl = classData(c);
+      let u = userData(me());
+      return d.keys().hasOnly(['uid', 'name', 'role', 'childName', 'status', 'requestedAt', 'classId', 'classTitle', 'tutorId', 'tutorName'])
+        && d.uid == me() && d.status == 'pending' && d.classId == c
+        && d.classTitle == cl.title && d.tutorId == cl.tutorId && d.tutorName == cl.tutorName
+        && cl.status == 'open' && cl.memberCount < cl.capacity && cl.tutorId != me()
+        && u.role in ['student', 'parent'] && d.role == u.role
+        && str(d.name, 1, 60) && str(d.childName, 0, 60)
+        && d.requestedAt == request.time;
+    }
+
+    function validPost(c, d) {
+      return d.type in ['announcement', 'assignment', 'document', 'poll', 'list']
+        && str(d.title, 1, 120) && str(d.body, 0, 3000) && d.commentsEnabled is bool
+        && d.authorId == me() && str(d.authorName, 1, 60) && d.createdAt == request.time
+        && (!('dueAt' in d) || d.dueAt == null || d.dueAt is timestamp)
+        && (d.type != 'poll' || (d.options is list && d.options.size() >= 2 && d.options.size() <= 8 && d.multi is bool))
+        && (d.type != 'list' || (d.listItems is list && d.listItems.size() >= 1 && d.listItems.size() <= 30))
+        && (d.type != 'document' || (str(d.filePath, 1, 300) && d.filePath.matches('classes/' + c + '/.*') && str(d.fileName, 1, 120) && d.fileSize is int && d.fileSize <= 10485760));
+    }
+
+    // ---------- users ----------
+    match /users/{userId} {
+      allow read: if signedIn() && me() == userId;
+      allow create: if signedIn() && me() == userId
+        && keysOnly(['name', 'role', 'ageConfirmed', 'locale', 'termsVersion', 'termsAcceptedAt', 'createdAt'])
+        && str(request.resource.data.name, 1, 60)
+        && request.resource.data.role in ['student', 'parent', 'tutor']
+        && request.resource.data.ageConfirmed == true
+        && request.resource.data.locale in ['ar', 'fr', 'en']
+        && str(request.resource.data.termsVersion, 1, 10)
+        && request.resource.data.termsAcceptedAt == request.time
+        && request.resource.data.createdAt == request.time;
+      allow update: if signedIn() && me() == userId
+        && changed().hasOnly(['name', 'locale', 'termsVersion', 'termsAcceptedAt'])
+        && str(request.resource.data.name, 1, 60)
+        && request.resource.data.locale in ['ar', 'fr', 'en']
+        && (!changed().hasAny(['termsVersion']) || request.resource.data.termsAcceptedAt == request.time);
+      allow delete: if false;
+
+      match /children/{childId} {
+        allow read, delete: if signedIn() && me() == userId;
+        allow create, update: if signedIn() && me() == userId
+          && keysOnly(['name', 'level'])
+          && str(request.resource.data.name, 1, 60) && str(request.resource.data.level, 1, 10);
+      }
+      match /tokens/{token} {
+        allow read, delete: if signedIn() && me() == userId;
+        allow create, update: if signedIn() && me() == userId
+          && keysOnly(['platform', 'createdAt']) && str(request.resource.data.platform, 1, 20);
+      }
+      match /blocks/{blockedId} {
+        allow read, delete: if signedIn() && me() == userId;
+        allow create: if signedIn() && me() == userId && blockedId != userId
+          && keysOnly(['name', 'createdAt']) && str(request.resource.data.name, 1, 60);
+      }
+      match /notifications/{nid} {
+        allow read, delete: if signedIn() && me() == userId;
+        allow update: if signedIn() && me() == userId && changed().hasOnly(['read']);
+      }
+    }
+
+    // ---------- tutors (public profile + reviews) ----------
+    match /tutors/{tutorId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && me() == tutorId && userData(me()).role == 'tutor'
+        && keysOnly(['name', 'bio', 'subjects', 'wilaya', 'years', 'ratingAvg', 'ratingCount'])
+        && request.resource.data.ratingAvg == 0 && request.resource.data.ratingCount == 0
+        && str(request.resource.data.name, 1, 60) && str(request.resource.data.bio, 0, 600)
+        && request.resource.data.subjects is list && request.resource.data.subjects.size() <= 13
+        && str(request.resource.data.wilaya, 0, 3)
+        && request.resource.data.years is int && request.resource.data.years >= 0 && request.resource.data.years <= 60;
+      allow update: if signedIn() && me() == tutorId
+        && changed().hasOnly(['name', 'bio', 'subjects', 'wilaya', 'years'])
+        && str(request.resource.data.name, 1, 60) && str(request.resource.data.bio, 0, 600)
+        && request.resource.data.subjects is list && request.resource.data.subjects.size() <= 13
+        && str(request.resource.data.wilaya, 0, 3)
+        && request.resource.data.years is int && request.resource.data.years >= 0 && request.resource.data.years <= 60;
+      allow delete: if false;
+
+      match /reviews/{reviewId} {
+        allow read: if signedIn();
+        allow create: if verified() && reviewId == me()
+          && keysOnly(['authorId', 'authorName', 'rating', 'text', 'classId', 'createdAt'])
+          && request.resource.data.authorId == me()
+          && str(request.resource.data.authorName, 1, 60)
+          && request.resource.data.rating is int && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+          && str(request.resource.data.text, 0, 500)
+          && request.resource.data.createdAt == request.time
+          && classData(request.resource.data.classId).tutorId == tutorId
+          && isApproved(request.resource.data.classId);
+        allow update: if verified() && reviewId == me()
+          && changed().hasOnly(['rating', 'text', 'updatedAt'])
+          && request.resource.data.rating is int && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+          && str(request.resource.data.text, 0, 500)
+          && request.resource.data.updatedAt == request.time;
+        allow delete: if signedIn() && reviewId == me();
+      }
+    }
+
+    // ---------- classes ----------
+    match /classes/{classId} {
+      allow read: if signedIn();
+      allow create: if verified() && userData(me()).role == 'tutor'
+        && keysOnly(['title', 'description', 'subject', 'level', 'price', 'priceUnit', 'wilaya', 'commune', 'mode', 'schedule', 'capacity', 'status', 'tutorId', 'tutorName', 'memberCount', 'pendingCount', 'createdAt'])
+        && validClass(request.resource.data)
+        && request.resource.data.tutorId == me()
+        && request.resource.data.tutorName == userData(me()).name
+        && request.resource.data.memberCount == 0 && request.resource.data.pendingCount == 0
+        && request.resource.data.status == 'open'
+        && request.resource.data.createdAt == request.time;
+      allow update: if verified() && resource.data.tutorId == me()
+        && changed().hasOnly(['title', 'description', 'subject', 'level', 'price', 'priceUnit', 'wilaya', 'commune', 'mode', 'schedule', 'capacity', 'status'])
+        && validClass(request.resource.data)
+        && request.resource.data.capacity >= resource.data.memberCount;
+      allow delete: if false;
+
+      match /private/{docId} {
+        allow read: if signedIn() && canRead(classId);
+        allow write: if verified() && isTutorOf(classId)
+          && keysOnly(['onlineLink'])
+          && str(request.resource.data.onlineLink, 0, 300)
+          && (request.resource.data.onlineLink == '' || request.resource.data.onlineLink.matches('https://.*'));
+      }
+
+      match /members/{memberId} {
+        allow read: if signedIn() && (memberId == me() || isTutorOf(classId));
+        allow create: if verified() && memberId == me() && validJoin(classId, request.resource.data);
+        allow update: if verified() && isTutorOf(classId)
+          && changed().hasOnly(['status', 'decidedAt'])
+          && resource.data.status == 'pending'
+          && request.resource.data.status in ['approved', 'rejected']
+          && (request.resource.data.status != 'approved' || classData(classId).memberCount < classData(classId).capacity)
+          && request.resource.data.decidedAt == request.time;
+        allow delete: if signedIn() && (memberId == me() || isTutorOf(classId));
+      }
+
+      match /posts/{postId} {
+        allow read: if signedIn() && canRead(classId);
+        allow create: if verified() && isTutorOf(classId)
+          && keysOnly(['type', 'title', 'body', 'authorId', 'authorName', 'createdAt', 'commentsEnabled', 'dueAt', 'fileName', 'filePath', 'fileSize', 'options', 'multi', 'listItems'])
+          && validPost(classId, request.resource.data);
+        allow update: if verified() && isTutorOf(classId)
+          && changed().hasOnly(['commentsEnabled'])
+          && request.resource.data.commentsEnabled is bool;
+        allow delete: if verified() && isTutorOf(classId);
+
+        match /reactions/{reactionId} {
+          allow read, delete: if signedIn() && reactionId == me();
+          allow create, update: if verified() && reactionId == me() && canRead(classId)
+            && keysOnly(['uid', 'emoji', 'createdAt'])
+            && request.resource.data.uid == me()
+            && request.resource.data.emoji in ['like', 'love', 'clap', 'think']
+            && request.resource.data.createdAt == request.time;
+        }
+        match /votes/{voteId} {
+          allow read, delete: if signedIn() && voteId == me();
+          allow create, update: if verified() && voteId == me() && canRead(classId)
+            && keysOnly(['uid', 'options', 'updatedAt'])
+            && request.resource.data.uid == me()
+            && request.resource.data.options is list
+            && request.resource.data.options.size() >= 1 && request.resource.data.options.size() <= 8
+            && request.resource.data.updatedAt == request.time;
+        }
+        match /comments/{commentId} {
+          allow read: if signedIn() && canRead(classId);
+          allow create: if verified() && canRead(classId)
+            && keysOnly(['authorId', 'authorName', 'text', 'createdAt'])
+            && request.resource.data.authorId == me()
+            && str(request.resource.data.authorName, 1, 60)
+            && str(request.resource.data.text, 1, 500)
+            && request.resource.data.createdAt == request.time
+            && (isTutorOf(classId) || get(/databases/$(database)/documents/classes/$(classId)/posts/$(postId)).data.commentsEnabled == true);
+          allow delete: if signedIn() && (resource.data.authorId == me() || isTutorOf(classId));
+        }
+      }
+    }
+
+    // Lets a signed-in user list their own memberships across classes.
+    match /{path=**}/members/{memberId} {
+      allow read: if signedIn() && resource.data.uid == me();
+    }
+
+    // ---------- reports (write-only) ----------
+    match /reports/{reportId} {
+      allow create: if verified()
+        && keysOnly(['reporterId', 'targetPath', 'targetUid', 'reason', 'createdAt'])
+        && request.resource.data.reporterId == me()
+        && str(request.resource.data.targetPath, 1, 300)
+        && str(request.resource.data.targetUid, 0, 60)
+        && str(request.resource.data.reason, 1, 300)
+        && request.resource.data.createdAt == request.time;
+      allow read, update, delete: if false;
+    }
+  }
+}

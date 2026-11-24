@@ -1,0 +1,45 @@
+# ---- Secrets (never commit) ----
+.env
+.env.*
+!.env.example
+secrets/*
+!secrets/keys.example.json
+keys.json
+config.json
+*.pem
+*.key
+*.p12
+*.pfx
+google-services.json
+GoogleService-Info.plist
+firebase_options.dart
+serviceAccount*.json
+firebase-adminsdk*.json
+# ---- Android / iOS signing ----
+*.jks
+*.keystore
+key.properties
+*.mobileprovision
+local.properties
+# ---- Build output, dependencies ----
+build/
+.dart_tool/
+.packages
+.pub-cache/
+.flutter-plugins
+.flutter-plugins-dependencies
+node_modules/
+functions/lib/
+coverage/
+ios/Pods/
+ios/.symlinks/
+android/.gradle/
+*.log
+# ---- IDE and OS ----
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+SETUP.md
